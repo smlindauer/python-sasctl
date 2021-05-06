@@ -9,7 +9,7 @@
 import six
 
 from .service import Service
-from ..core import current_session, get, delete
+from ..core import current_session, get, delete, sasctl_command, HTTPError
 
 FUNCTIONS = {'Analytical', 'Classification', 'Clustering', 'Forecasting',
              'Prediction', 'Text categorization', 'Text extraction',
@@ -38,7 +38,7 @@ class ModelRepository(Service):
 
     _SERVICE_ROOT = '/modelRepository'
 
-    list_repositories, get_repository, update_repository, \
+    list_repositories, _, update_repository, \
         delete_repository = Service._crud_funcs('/repositories', 'repository',
                                                 get_filter=_get_filter)
 
@@ -147,6 +147,67 @@ class ModelRepository(Service):
         link = cls.get_model_link(model, 'contents', refresh=True)
 
         return cls.request_link(link, 'contents')
+
+    @classmethod
+    @sasctl_command('get', 'repositories')
+    def get_repository(cls, repository, refresh=False):
+        """Return a repository instance.
+
+        Parameters
+        ----------
+        repository : str or dict
+            Name, ID, or dictionary representation of the repository.
+        refresh : bool, optional
+            Obtain an updated copy of the repository.
+
+        Returns
+        -------
+        RestObj or None
+            A dictionary containing the repository attributes or None.
+
+        Notes
+        -------
+        If `repository` is a complete representation of the repository it will be
+        returned unless `refresh` is set.  This prevents unnecessary REST
+        calls when data is already available on the client.
+
+        """
+        # If the input already appears to be the requested object just
+        # return it, unless a refresh of the data was explicitly requested.
+        if isinstance(repository, dict) and all(k in repository for k in ('id', 'name')):
+            if refresh:
+                repository = repository['id']
+            else:
+                return repository
+
+        if cls.is_uuid(repository):
+            try:
+                # Attempt to GET the repository directly.  Access may be restricted, so allow HTTP 403 errors
+                # and fall back to using list_repositories() instead.
+                return cls.get('/repositories/{id}'.format(id=repository))
+            except HTTPError as e:
+                if e.code != 403:
+                    raise e
+
+        results = cls.list_repositories()
+
+        # Not sure why, but as of 19w04 the filter doesn't seem to work
+        for result in results:
+            if result['name'] == str(repository) or result['id'] == str(repository):
+                # Make a request for the specific object so that ETag
+                # is included, allowing updates.
+                try:
+                    if cls.get_link(result, 'self'):
+                        return cls.request_link(result, 'self')
+
+                    id_ = result.get('id', result['name'])
+                    return cls.get('/repositories/{id}'.format(id=id_))
+                except HTTPError as e:
+                    # NOTE: As of Viya 4.0.1 access to GET a repository is restricted to admin users out of the box.
+                    # Try to GET the repository, but ignore any 403 (permission denied) errors.
+                    if e.code != 403:
+                        raise e
+                return result
 
     @classmethod
     def create_model(cls, model, project,
@@ -332,15 +393,20 @@ class ModelRepository(Service):
         RestObj
 
         """
-        repo = cls.get_repository('Repository 1')  # Default in 19w04
-        if repo is None:
-            repo = cls.get_repository('Public')  # Default in 19w21
-        if repo is None:
-            all_repos = cls.list_repositories()
-            if all_repos:
-                repo = all_repos[0]
+        all_repos = cls.list_repositories()
 
-        return repo
+        if all_repos:
+            # If nothing else, return the first repository
+            repo = all_repos[0]
+
+            # Check repository names to find a better default.
+            # 'Repository 1' was default in 19w04
+            # 'Public' was default in 19w21
+            for r in all_repos:
+                if r.name in ('Repository 1', 'Public'):
+                    repo = r
+                    break
+            return repo
 
     @classmethod
     def create_project(cls, project, repository, **kwargs):
@@ -386,10 +452,10 @@ class ModelRepository(Service):
         project : str or dict
             The name or id of the model project, or a dictionary
             representation of the project.
-        description : str
-            The description of the model.
         file : bytes
             The ZIP file containing the model and contents.
+        description : str
+            The description of the model.
 
         Returns
         -------
@@ -462,7 +528,6 @@ class ModelRepository(Service):
         model : str or dict
             The name, id, or dictionary representation of a model.
 
-
         Returns
         -------
         list
@@ -481,7 +546,7 @@ class ModelRepository(Service):
 
         Copies all of the analytic stores for a model to the pre-defined
         server location (/config/data/modelsvr/astore).
-        To enable publishing a scoring, models that contain analytic stores
+        To enable publishing and scoring, models that contain analytic stores
         need the ASTORE files to be copied to a set location
         (/config/data/modelsrv/astore).  This location is used for
         integration with Event Stream Processing and others. This request
@@ -528,3 +593,109 @@ class ModelRepository(Service):
         for delfile in filelist:
             modelfileuri = cls.get_link(delfile, rel)
             delete(modelfileuri['uri'])
+
+    @classmethod
+    def copy_python_resources(cls, model):
+        """Moves a model's score resources to the Compute server.
+
+        Copies all of the Python score resources for a model to the pre-defined
+        server location (/models/resources/viya/<model-UUID>/). To enable 
+        publishing and scoring, models that contain Python scoring resources 
+        need the score resource files to be copied to a set location 
+        (/models/resources/viya/<model-UUID>/). This location is used for
+        integration with Event Stream Processing and others. This request
+        invokes an asynchronous call to copy the score resource files. Check
+        the individual score resource uris to get the completion state:
+        pending, copying, success, failure. Please review the full Model
+        Manager documentation before using.
+        
+        Parameters
+        ----------
+        model : str or dict
+            The name or id of the model, or a dictionary representation of
+            the model.
+        
+        Returns
+        -------
+        RestObj or None
+            JSON response detailing the API metadata
+
+        """
+        if cls.is_uuid(model):
+            id_ = model
+        elif isinstance(model, dict) and 'id' in model:
+            id_ = model['id']
+        else:
+            model = cls.get_model(model)
+            id_ = model['id']
+        
+        return cls.put('/models/%s/scoreResources' % id_, headers={'Accept': 'application/json'})
+    
+    @classmethod
+    def convert_python_to_ds2(cls, model):
+        """Converts a Python model to DS2
+        
+        For SAS Viya 3.5 Python models on SAS Model Manager, wrap the Python score code in DS2
+        and convert the model score code type to DS2. Models converted in this way are not 
+        scoreable by CAS.
+
+        Parameters
+        ----------
+        model : str or dict
+            The name or id of the model, or a dictionary representation of
+            the model.
+            
+        Returns
+        -------
+        API response
+            JSON response detailing the API metadata
+
+        """
+        if cls.is_uuid(model):
+            id_ = model
+        elif isinstance(model, dict) and 'id' in model:
+            id_ = model['id']
+        else:
+            model = cls.get_model(model)
+            id_ = model['id']
+            
+        if isinstance(model, (str, dict)):
+            model = cls.get_model(id_)
+            
+        ETag = model._headers['ETag']
+        accept = 'text/vnd.sas.source.ds2'
+        content = 'application/json'
+        
+        return cls.put('/models/%s/typeConversion' % id_,
+                       headers={'Accept-Item': accept,
+                                'Content-Type': content,
+                                'If-Match': ETag})
+        
+    @classmethod
+    def get_model_details(cls, model):
+        """Get model details from SAS Model Manager
+        
+        Get model details that pertain to model properties, model metadata,
+        model input, output, and target variables, and user-defined values.
+
+        Parameters
+        ----------
+        model : str or dict
+            The name or id of the model, or a dictionary representation of
+            the model.
+            
+        Returns
+        -------
+        API response
+            JSON response detailing the model details
+
+        """
+        if cls.is_uuid(model):
+            id_ = model
+        elif isinstance(model, dict) and 'id' in model:
+            id_ = model['id']
+        else:
+            model = cls.get_model(model)
+            id_ = model['id']
+            
+        return cls.get('/models/%s' % id_)
